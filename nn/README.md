@@ -1,43 +1,69 @@
 # Task 2 — Drone Localisation Neural Network
 
 Prototype NN-based system that takes an FPV drone image, uses the bird's-eye
-warp from Task 1 as an intermediary, and localises the drone on a 500 km²
-satellite map (500 tiles of 1 km² each). Deployable on Raspberry Pi 5.
+warp from Task 1 as an intermediary, and localises the drone on a satellite map.
+Deployable on Raspberry Pi 5.
+
+---
+
+## Real Data (this repo)
+
+| File | Size | Role |
+|------|------|------|
+| `images/src/processed/image_fpv_drone.png` | 490×216 px | Raw FPV camera frame |
+| `images/src/processed/satellite_map.png` | 570×570 px | Satellite reference map |
+| `images/dst/dst/birds_eye_map_*.png` | 800×800 px | Task 1 output — bird's-eye warp |
+
+The bird's-eye images are 800×800 but only the top portion contains real ground
+pixels — the rest is black. At 60 m / -25° pitch, approximately the top 412 rows
+are non-black. `inference.py query` automatically crops the non-black bounding
+box before encoding so the encoder sees only real ground texture.
+
+The satellite map (570×570 px) is smaller than the default 800 px patch size
+assumed in the original design. The updated sliding window automatically clamps
+to `min(patch_size, H, W)`, so it still produces meaningful patches.
+
+**Recommended pitch for best ground coverage:** ≥ -40° at ≥ 150 m altitude.
+Shallower angles (e.g. -25° / 60 m) produce a narrow trapezoid with large black
+borders, which reduces encoder quality.
 
 ---
 
 ## System Overview
 
 ```
-FPV drone image
+FPV drone image  (490×216)
       │
       ▼
- Task 1: C++ warp
+ Task 1: C++ geometric warp
       │
       ▼
-800×800 bird's-eye patch (1 px = 1 m, drone at centre)
+800×800 bird's-eye patch — large black border outside warped ground region
+      │
+      ▼ (auto crop non-black → ~800×412 at -40°/150m)
       │
       ├──────────────────────────────────────────┐
       ▼                                          │
  Stage 1: Coarse retrieval                       │
- Encoder (MobileNetV3-Small)                     │
+ Encoder (MobileNetV3-Small, 224×224 input)      │
       │                                          │
       ▼                                          │
  128-dim L2-norm embedding                       │
       │                                          │
       ▼                                          │
- FAISS flat-IP index query                       │
- (pre-encoded satellite patches)                 │
+ FAISS IndexFlatIP query                         │
+ (pre-encoded 256×256 satellite patches)         │
       │                                          │
       ▼                                          │
- Top-K candidate tiles + rough (x,y)             │
+ Top-K candidates (tile, patch offset)           │
       │                                          │
       ▼                                          │
  Stage 2: Fine localisation ◄────────────────────┘
- Normalised cross-correlation (NCC)
+ NCC (cv2.matchTemplate TM_CCOEFF_NORMED)
+ query resized to fit satellite if needed
       │
       ▼
- Sub-metre (x,y) offset within tile → GPS coordinates
+ Drone (x, y) in satellite pixel coordinates
 ```
 
 ---
@@ -49,15 +75,14 @@ FPV drone image
 | Component | Detail |
 |-----------|--------|
 | Backbone | MobileNetV3-Small (ImageNet pretrained) |
-| Output of backbone | 576-dim feature map after adaptive avg pool |
+| Backbone output | 576-dim after adaptive avg pool |
 | Projection head | Linear(576→256) → BN → ReLU → Linear(256→128) |
-| Final normalisation | L2-norm → cosine sim == dot product |
-| Input | 224×224 RGB, ImageNet mean/std |
-| Parameters | ~2.5 M (backbone) + ~150 k (head) |
+| Final normalisation | L2-norm — cosine sim == dot product in FAISS |
+| Input size | 224×224 RGB, ImageNet mean/std |
+| Parameters | ~2.5 M backbone + ~150 k head |
 
-The same encoder weights are used for both the drone branch and the satellite
-branch (Siamese / shared-weight architecture). This halves the number of
-parameters and forces the model to learn a joint embedding space.
+Same weights for both the drone branch and the satellite branch (Siamese
+architecture). Forces both views into the same embedding space.
 
 ### Loss — InfoNCE (NT-Xent)
 
@@ -65,78 +90,90 @@ parameters and forces the model to learn a joint embedding space.
 L = -1/N Σ_i log( exp(q_i·k_i / τ) / Σ_j exp(q_i·k_j / τ) )
 ```
 
-- **τ (temperature)** = 0.07 (default). Lower → sharper distribution → harder task.
-- **Positive pair** = (bird's-eye patch at GPS position X, satellite crop at X).
-- **Negatives** = all other satellite crops in the batch (in-batch negatives).
-- Loss is computed symmetrically (q→k and k→q) and averaged.
-
-Larger batches provide more negatives and improve representation quality.
-Recommended batch size ≥ 64 for real training.
+- **τ** = 0.07 (default). Lower → sharper distribution → harder contrastive task.
+- **Positive pair**: (bird's-eye patch at location X, satellite crop at X).
+- **Negatives**: all other satellite crops in the same batch.
+- Loss computed symmetrically (q→k and k→q) and averaged.
+- Larger batches (≥ 64) improve representation quality by providing more negatives.
 
 ### Augmentation
 
-| Branch | Augmentation |
-|--------|-------------|
-| Drone (query) | RandomResizedCrop (scale 0.85–1.0), RandomAffine shear ±5° (pitch proxy), ColorJitter (brightness/contrast/saturation), RandomHorizontalFlip |
-| Satellite (key) | RandomResizedCrop (scale 0.9–1.0), RandomRotation ±180°, mild ColorJitter |
+| Branch | Transforms |
+|--------|-----------|
+| Drone (query) | RandomResizedCrop (0.85–1.0), RandomAffine shear ±5° (pitch proxy), ColorJitter, RandomHorizontalFlip |
+| Satellite (key) | RandomResizedCrop (0.9–1.0), RandomRotation ±180°, mild ColorJitter |
 
 ---
 
 ## Offline Index Build
 
 ```bash
+# Using the real satellite map (570×570):
 python inference.py build \
-    --tiles-dir /data/satellite_tiles \
+    --tiles-dir /path/to/satellite/tiles/ \
     --index-out index.faiss \
-    --checkpoint checkpoints/final.pt
+    --patch-size 256 \
+    --stride 100
+
+# Example output for satellite_map.png (570×570):
+# [1/1] satellite_map.png (570×570px, eff_patch=256px): 16 patches
+# Index saved → index.faiss  (16 vectors, D=128)
 ```
 
-Each 1 km² tile (800×800 px) is sliced into overlapping 800×800 patches with
-stride 200 px, encoded, and stored in a FAISS `IndexFlatIP` (exact inner
-product). For 500 tiles the index contains roughly:
+> **Important:** put only satellite images in `--tiles-dir`. If FPV or bird's-eye
+> images are in the same folder they will be indexed too and pollute the search.
 
-```
-patches per tile ≈ ((800 - 800) / 200 + 1)² = 1 (full tile only, no sub-patches needed
-                                                    since patch == tile size)
-```
+The sliding window is adaptive:
+- If the image is smaller than `--patch-size`, the effective patch is clamped to
+  `min(patch_size, H, W)`, so at least one patch is always extracted.
+- Stride is similarly clamped to never exceed the effective patch size.
 
-In practice tiles can be larger; use `--stride` to control density vs. index size.
+**Index size estimate:**
 
-**Estimated index size:** 500 tiles × 128 floats × 4 bytes ≈ 0.25 MB (trivially fits RPi5 RAM).
-With sub-tile patches (e.g. 4×4 grid per tile) → ~4 MB, still fine.
+| Map size | patch=256, stride=100 | patch=800 (full tile) |
+|----------|-----------------------|----------------------|
+| 570×570 (this repo) | 16 patches × 128×4 B = 8 KB | 1 patch |
+| 1000×1000 km² (500 tiles) | ~500 k patches → ~250 MB | ~2 MB |
+
+For > 100 k patches replace `IndexFlatIP` with `IndexIVFFlat` or `IndexHNSWFlat`.
 
 ---
 
 ## Online Inference (per frame)
 
-1. Bird's-eye patch → encoder → 128-dim embedding (~30 ms on RPi5 INT8).
-2. FAISS IP search → top-5 candidate tiles + patch offsets (~5 ms).
-3. NCC (`cv2.matchTemplate`) within best tile → sub-metre (x, y) (~15 ms).
-4. **Total target: ~65 ms @ 15 fps on RPi5.**
-
 ```bash
 python inference.py query \
-    --image bird_eye.png \
+    --image ../images/dst/dst/birds_eye_map_20260407_113340_150_-40_0_0_110_80.png \
     --index index.faiss \
-    --checkpoint checkpoints/final.pt
+    --tiles-dir ../images/src/processed/ \
+    --top-k 5
 ```
 
----
+**Steps:**
 
-## RPi5 Deployment
+1. Load 800×800 bird's-eye PNG.
+2. Auto-crop non-black bounding box (removes the empty black border from the warp).
+3. Encode cropped patch → 128-dim embedding.
+4. FAISS IP search → top-K candidate patches.
+5. Load best candidate tile; resize query to fit within tile if needed.
+6. NCC (`cv2.matchTemplate`) within ±100 px search window.
+7. Report drone position in tile pixel coordinates.
 
-```bash
-# Export to ONNX
-python inference.py export \
-    --checkpoint checkpoints/final.pt \
-    --out encoder.onnx
+**Measured latency on CPU (no trained weights, ImageNet init):**
 
-# Run with onnxruntime (pre-installed on RPi5 via pip)
-pip install onnxruntime faiss-cpu opencv-python
-```
+| Step | Time |
+|------|------|
+| Encode (CPU, PyTorch FP32) | ~50 ms |
+| FAISS search (16 vectors) | < 1 ms |
+| NCC fine alignment | ~15 ms |
+| **Total** | **~65–75 ms** |
 
-The ONNX model is dynamically INT8-quantised; for best accuracy on RPi5 use
-static quantisation with `onnxruntime.quantization` and a calibration dataset.
+On RPi5 with ONNX INT8 encoder the encode step targets ~30 ms.
+
+> **Note on match scores:** with ImageNet-pretrained weights and no fine-tuning,
+> cosine similarity scores will be low (< 0.1). This is expected — the encoder
+> has not learned the drone↔satellite domain. Scores improve significantly after
+> contrastive training on real paired data.
 
 ---
 
@@ -146,15 +183,39 @@ static quantisation with `onnxruntime.quantization` and a calibration dataset.
 # Install dependencies
 pip install -r requirements.txt
 
-# Overfit sanity check (single synthetic pair, ~30 s)
+# Overfit sanity check (single synthetic pair — passes in ~4 steps on GPU)
 python train.py --overfit
 
-# Full synthetic training run
+# Full synthetic training
 python train.py --epochs 20 --batch-size 32
+
+# Custom hyperparameters
+python train.py --epochs 50 --batch-size 64 --lr 1e-4
 
 # Resume from checkpoint
 python train.py --checkpoint checkpoints/epoch_015.pt
 ```
+
+Checkpoints are saved every 5 epochs to `checkpoints/epoch_XXX.pt` and at the
+end as `checkpoints/final.pt`.
+
+---
+
+## RPi5 Deployment
+
+```bash
+# Export trained encoder to ONNX
+python inference.py export \
+    --checkpoint checkpoints/final.pt \
+    --out encoder.onnx
+
+# RPi5: install runtime dependencies
+pip install onnxruntime faiss-cpu opencv-python
+```
+
+Dynamic INT8 quantisation is applied at export. For production accuracy use
+static quantisation with `onnxruntime.quantization` and a calibration set of
+real drone images.
 
 ---
 
@@ -162,29 +223,29 @@ python train.py --checkpoint checkpoints/epoch_015.pt
 
 | Dimension | Choice | Tradeoff |
 |-----------|--------|----------|
-| Backbone | MobileNetV3-Small | Fast (RPi5 friendly) but lower accuracy than ResNet/EfficientNet |
-| Embedding dim | 128 | Small index, fast FAISS search; lower capacity than 256/512 |
-| FAISS index | FlatIP (exact) | Accurate but O(N) scan; swap for IVF/HNSW if N > 100 k patches |
-| NCC fine alignment | CPU, OpenCV | Simple, no GPU needed; struggles with rotated patches |
-| Stage 2 | NCC | No learned parameters; replace with a learned matcher (e.g. LoFTR) for higher accuracy |
+| Backbone | MobileNetV3-Small | RPi5-friendly; lower accuracy than ResNet/EfficientNet |
+| Embedding dim | 128 | Small index, fast search; lower capacity than 256/512 |
+| Patch size | 256 px (default) | Good coverage on small maps; increase for larger tiles |
+| FAISS index | FlatIP (exact) | Accurate but O(N); swap for IVF/HNSW above 100 k patches |
+| NCC | CPU, OpenCV | No parameters, no GPU; fails under large yaw uncertainty |
 
 ---
 
 ## Pros & Cons
 
 **Pros**
+- No GPS required at inference.
 - Lightweight: runs on RPi5 without GPU.
-- No GPS required at inference time.
 - Offline index build decoupled from online query.
-- Two-stage design cleanly separates coarse (learning) and fine (geometry) problems.
 - Contrastive loss doesn't require class labels — scales to large unlabelled datasets.
+- Adaptive sliding window handles satellite maps of any size.
+- Auto non-black crop improves encoder quality on shallow-pitch bird's-eye images.
 
 **Cons**
-- Requires representative satellite + drone training pairs (data collection is hard).
-- NCC stage fails under large rotation (drone yaw uncertainty); needs compass or
-  multi-angle patch augmentation.
-- Single-scale encoder may miss texture-poor areas (fields, open water).
-- FAISS FlatIP is exact but O(N); large maps need IVF indexing.
+- NCC fails under large drone yaw; needs compass or rotational augmentation.
+- Single-scale encoder may miss texture-poor areas (open fields, water).
+- No trained weights — scores are near-random until fine-tuned on paired data.
+- FPV and satellite images must be kept in separate folders for index building.
 
 ---
 
@@ -192,11 +253,11 @@ python train.py --checkpoint checkpoints/epoch_015.pt
 
 | Alternative | Why not chosen |
 |-------------|---------------|
-| SuperGlue / LoFTR (keypoint matcher) | Too heavy for RPi5 |
-| NetVLAD place recognition | Designed for street-level imagery, not top-down |
-| Direct regression (CNN → lat/lon) | Requires huge labelled dataset; poor generalisation |
-| Particle filter localisation | Complex to implement; needs motion model |
-| EfficientNet backbone | Slightly heavier; MobileNetV3 better RPi5 latency |
+| SuperGlue / LoFTR | Too heavy for RPi5 |
+| NetVLAD | Designed for street-level, not top-down imagery |
+| Direct regression (CNN → lat/lon) | Requires large labelled dataset; poor generalisation |
+| Particle filter | Complex motion model needed |
+| EfficientNet backbone | Slightly heavier; MobileNetV3 better on RPi5 |
 
 ---
 
@@ -206,7 +267,7 @@ python train.py --checkpoint checkpoints/epoch_015.pt
 nn/
 ├── models/
 │   ├── __init__.py
-│   └── encoder.py        # MobileNetV3 + 128-dim embedding head
+│   └── encoder.py        # MobileNetV3-Small + 128-dim L2-norm head
 ├── data/
 │   ├── __init__.py
 │   └── dataset.py        # SyntheticPairDataset + RealPairDataset stub

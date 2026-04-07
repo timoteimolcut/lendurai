@@ -166,11 +166,35 @@ Bird's-eye patch (800×800)
   Drone (x, y) in tile pixels = metres
 ```
 
+### Real data in this repo
+
+| File | Size | Role |
+|------|------|------|
+| `images/src/processed/image_fpv_drone.png` | 490×216 px | Raw FPV input |
+| `images/src/processed/satellite_map.png` | 570×570 px | Reference satellite map |
+| `images/dst/dst/birds_eye_map_*.png` | 800×800 px | Task 1 output (bird's-eye warp) |
+
+The bird's-eye output is 800×800 but contains a large black border — at 60 m /
+-25° pitch, only the top ~412 rows have real ground pixels. The query pipeline
+auto-crops this black border before encoding. For better ground coverage use
+steeper pitch angles (≥ -40° at ≥ 150 m).
+
+The satellite map (570×570) is smaller than the 800 px patch size originally
+assumed. The updated sliding window automatically adapts: `eff_patch =
+min(patch_size, H, W)`, so at least one patch is always extracted regardless of
+map size.
+
+> Keep only satellite images in `--tiles-dir` when building the index.
+> If FPV or bird's-eye images share the same folder they will be indexed too.
+
 ### Setup
 
 ```bash
 cd nn
 pip install -r requirements.txt
+# or via conda:
+conda install -c conda-forge opencv
+conda install -c pytorch faiss-cpu
 ```
 
 ### Training
@@ -216,46 +240,53 @@ Negatives: all other crops in the batch. Temperature τ = 0.07 (default).
 #### 1. Build the FAISS index (offline, once per map update)
 
 ```bash
+# With the real satellite_map.png (570×570):
 python inference.py build \
-    --tiles-dir /data/satellite_tiles \
+    --tiles-dir ../images/src/processed/ \
     --index-out index.faiss \
-    --checkpoint checkpoints/final.pt
+    --patch-size 256 --stride 100
+
+# Output:
+# [1/1] satellite_map.png (570×570px, eff_patch=256px): 16 patches
+# Index saved → index.faiss  (16 vectors, D=128)
 ```
 
-Slides an 800×800 window (stride 200 px) over every tile, encodes each patch,
-and stores embeddings in a FAISS `IndexFlatIP`. Metadata (tile name, patch
-offset) is saved alongside as `index.npz`.
+The `--patch-size` is automatically clamped to the image dimensions, so this
+works for satellite maps of any size. Use `--patch-size 800 --stride 200` for
+full 1 km² tiles.
 
 #### 2. Query (online, per frame)
 
 ```bash
 python inference.py query \
-    --image bird_eye.png \
+    --image ../images/dst/dst/birds_eye_map_20260407_113340_150_-40_0_0_110_80.png \
     --index index.faiss \
-    --checkpoint checkpoints/final.pt \
-    --tiles-dir /data/satellite_tiles \
+    --tiles-dir ../images/src/processed/ \
     --top-k 5
 ```
 
 Omit `--tiles-dir` to skip NCC and get coarse results only.
 
-**Example output:**
+**Real output (ImageNet weights, no fine-tuning):**
 ```
-Query: bird_eye.png  (coarse: 28.4 ms)
+Non-black crop: 800×800 → 800×412 px
 
-Rank   Score  Tile                            Patch offset (x,y) px = m
-----------------------------------------------------------------------
-1     0.8934  tile_042                        (200, 400)
-2     0.8102  tile_041                        (400, 200)
+Query: birds_eye_map_...  (coarse: 57.1 ms)
+
+Rank    Score  Tile             Patch offset (x,y) px
+1      0.0593  satellite_map    (100, 200)
 ...
 
-Fine localisation (NCC, 14.1 ms):
-  Tile      : tile_042
-  Patch TL  : (213, 387) px
-  Drone pos : (613, 787) px = (613 m, 787 m) from tile origin
-  NCC score : 0.7821  (1.0 = perfect match)
-  Total     : 42.5 ms
+Fine localisation (NCC, 15.6 ms):
+  Tile       : satellite_map
+  Match TL   : (0, 277) px in tile
+  Drone pos  : (400, 483) px from tile origin
+  NCC score  : 0.3469
+  Total time : 72.7 ms
 ```
+
+Cosine scores are low (< 0.1) because the encoder has not been fine-tuned on
+drone/satellite imagery. They improve significantly with contrastive training.
 
 #### 3. Export to ONNX (RPi5 deployment)
 
@@ -268,12 +299,13 @@ python inference.py export \
 The resulting `encoder.onnx` runs on `onnxruntime` (pre-installable on RPi5
 via `pip install onnxruntime`). Dynamic INT8 quantisation is applied.
 
-**Latency budget on RPi5 5:**
+**Measured latency (CPU, PyTorch FP32, no fine-tuning):** ~73 ms total.
+**Target latency on RPi5 (ONNX INT8):**
 
 | Stage | Time |
 |-------|------|
 | Encoder (ONNX INT8) | ~30 ms |
-| FAISS search | ~5 ms |
+| FAISS search | < 1 ms |
 | NCC fine alignment | ~15 ms |
 | **Total** | **~50–65 ms** |
 
