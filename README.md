@@ -1,21 +1,24 @@
 # LendurAI — GPS-Free FPV Drone Localisation
 
-Two-stage system that localises a drone on a 500 km² satellite map using only the onboard
-camera — no GPS required. Designed to run on a Raspberry Pi 5.
+Two-stage system that localises a drone on a satellite map using only the onboard
+camera — no GPS required. Deployable on Raspberry Pi 5.
 
 ```
-FPV image  →  [Task 1: C++ geometric warp]  →  800×800 bird's-eye patch
+FPV image  →  [Task 1: C++ geometric warp]  →  800×800 bird's-eye patch (1px=1m)
                                                         │
-                                    ┌───────────────────┴────────────────────┐
-                                    ▼                                        │
-                         Stage 1: FAISS coarse retrieval                     │
-                         (MobileNetV3 encoder + embedding index)             │
-                                    │                                        │
-                                    ▼                                        │
-                         Stage 2: NCC fine localisation ◄────────────────────┘
+                                    ┌───────────────────┴───────────────────┐
+                                    ▼                                       │
+                         Stage 1: FAISS coarse retrieval                    │
+                         MobileNetV3 encoder → 128-dim embedding            │
+                                    │                                       │
+                                    ▼                                       │
+                         Stage 2: NCC fine localisation ◄───────────────────┘
                                     │
                                     ▼
-                         Drone (x, y) in metres on the satellite map
+                         Drone (x, y) in satellite pixel coordinates
+                                    │
+                                    ▼
+                         Footprint overlay on satellite map  (visualize)
 ```
 
 ---
@@ -24,28 +27,39 @@ FPV image  →  [Task 1: C++ geometric warp]  →  800×800 bird's-eye patch
 
 ```
 lendurai/
-├── cv/                     # Task 1 — C++ bird's-eye warp
-│   ├── main.cpp            # Production warp pipeline
+├── cv/                         # Task 1 — C++ bird's-eye warp
+│   ├── main.cpp                # Production warp pipeline
 │   ├── CMakeLists.txt
-│   └── old/                # Archived prototypes (manual calib, trackbars, pinhole ref)
-├── nn/                     # Task 2 — PyTorch localisation system
-│   ├── models/
-│   │   └── encoder.py      # MobileNetV3-Small + 128-dim embedding head
-│   ├── data/
-│   │   └── dataset.py      # SyntheticPairDataset + RealPairDataset stub
-│   ├── losses/
-│   │   └── infonce.py      # InfoNCE contrastive loss
-│   ├── train.py            # Training loop + overfit sanity test
-│   ├── inference.py        # FAISS index build / query / ONNX export
+│   └── old/                    # Archived prototypes (manual calib, trackbars, pinhole ref)
+├── nn/                         # Task 2 — PyTorch localisation system
+│   ├── models/encoder.py       # MobileNetV3-Small + 128-dim L2-norm head
+│   ├── data/dataset.py         # SyntheticPairDataset + RealPairDataset stub
+│   ├── losses/infonce.py       # InfoNCE contrastive loss
+│   ├── train.py                # Training loop + overfit sanity test
+│   ├── inference.py            # FAISS index build / query / visualize / ONNX export
 │   ├── requirements.txt
-│   └── README.md           # Detailed NN architecture docs
+│   └── README.md               # Detailed NN architecture docs
 ├── scripts/
-│   └── sweep.sh            # Batch parameter sweep for the C++ binary
+│   └── sweep.sh                # Batch parameter sweep for the C++ binary
 ├── images/
-│   ├── src/processed/      # Input FPV images
-│   └── dst/sweep/          # Bird's-eye warp outputs
+│   ├── src/processed/          # Input images (FPV + satellite)
+│   └── dst/dst/                # Bird's-eye warp outputs
 └── .gitignore
 ```
+
+---
+
+## Real Data in this Repo
+
+| File | Size | Role |
+|------|------|------|
+| `images/src/processed/image_fpv_drone.png` | 490×216 px | Raw FPV camera frame |
+| `images/src/processed/satellite_map.png` | 570×570 px | Satellite reference map |
+| `images/dst/dst/birds_eye_map_*.png` | 800×800 px | Task 1 output (bird's-eye warp) |
+
+The bird's-eye output is 800×800 but contains a large black border — only the
+warped ground region has real pixels (trapezoid shape, roughly the top 400 rows).
+All pipeline steps auto-crop this border before processing.
 
 ---
 
@@ -53,9 +67,9 @@ lendurai/
 
 ### What it does
 
-Takes an FPV drone image and reprojects it to a top-down 800×800 px map at
-**1 px = 1 m**, with the drone at the centre (400, 400). Accepts known flight
-parameters or can auto-estimate pitch from the image horizon.
+Reprojects an FPV drone image to a top-down 800×800 canvas at **1 px = 1 m**,
+drone at centre (400, 400). Accepts known flight parameters or can auto-estimate
+pitch from the image horizon using Sobel edge energy.
 
 ### Build
 
@@ -71,139 +85,112 @@ Requires: CMake ≥ 3.16, OpenCV, C++17 compiler.
 ### Usage
 
 ```bash
-./birdseye <alt_m> <pitch_deg|AUTO> <roll_deg> <yaw_deg> <hfov_deg> <vfov_deg>
+./build/birdseye <alt_m> <pitch_deg|AUTO> <roll_deg> <yaw_deg> <hfov_deg> <vfov_deg>
 ```
 
 | Argument | Description |
 |----------|-------------|
-| `alt_m` | Flight altitude in metres (must be > 0) |
-| `pitch_deg` | Camera pitch — negative = nose down. Pass `AUTO` to estimate from image |
-| `roll_deg` | Roll in degrees — positive = right wing down |
-| `yaw_deg` | Yaw in degrees — positive = nose right |
-| `hfov_deg` | Horizontal field of view (0–180°) |
-| `vfov_deg` | Vertical field of view (0–180°) |
+| `alt_m` | Altitude in metres — must be > 0 |
+| `pitch_deg` | Camera pitch, negative = nose down. Use `AUTO` to estimate from horizon |
+| `roll_deg` | Roll in degrees, positive = right wing down |
+| `yaw_deg` | Yaw in degrees, positive = nose right |
+| `hfov_deg` | Horizontal FOV in degrees (0–180) |
+| `vfov_deg` | Vertical FOV in degrees (0–180) |
 
 ```bash
-# Fixed pitch
-./birdseye 60 -25 0 0 110 80
+# Good coverage — steep pitch, high altitude
+./build/birdseye 150 -40 0 0 110 80
+
+# Shallow pitch — large black border in output
+./build/birdseye 60 -25 0 0 110 80
 
 # Auto-estimate pitch from horizon
-./birdseye 60 AUTO 0 0 110 80
-
-# High altitude, steep pitch
-./birdseye 200 -70 0 0 110 80
+./build/birdseye 150 AUTO 0 0 110 80
 ```
 
-Output is saved to `images/dst/sweep/birds_eye_map_<timestamp>_<params>.png` and
-displayed in an OpenCV window.
+Output is saved to `images/dst/sweep/birds_eye_map_<timestamp>_<params>.png`
+and displayed in an OpenCV window.
 
-> **Note:** Input image path is currently hardcoded to
-> `images/src/processed/image_fpv_drone.png`. Change the `IMAGE_PATH` define in
-> `main.cpp` or pass it as an argument (future improvement).
+> **Note:** Input path is hardcoded to `images/src/processed/image_fpv_drone.png`
+> via `IMAGE_PATH` in `main.cpp`.
 
 ### Geometry engine
 
-Camera convention: optical axis = +Z, image right = +X, image down = +Y.
+Camera frame: optical axis = +Z, right = +X, down = +Y.
 World frame: forward = +Y, right = +X, up = +Z.
+Rotation order: pitch → roll → yaw.
 
 ```
-Camera ray  →  [pitch → roll → yaw rotation]  →  World ray
-                                                        │
-                                             t = -altitude / ray_z
-                                                        │
-                                                   Ground hit (x, y)
+Pixel  →  normalised ray (camera)
+       →  [pitch → roll → yaw]  →  world ray
+       →  ground intersection: t = -altitude / ray_z
+       →  ground point (x_m, y_m)
+       →  canvas pixel (400 + x_m, 400 - y_m)
 ```
-
-Rays at or above the horizon (`ray_z > -1e-6`) are clamped to prevent the
-homography from blowing up. The image is cropped to the ground strip before
-warping.
 
 ### Parameter sweep
 
 ```bash
-cd scripts
-./sweep.sh      # requires ../cv/build/birdseye to exist
+cd scripts && ./sweep.sh   # requires cv/build/birdseye
 ```
 
-Runs the binary over a grid of altitudes (`200, 300, 400 m`) and pitches
-(`-60` to `-85°`) and saves all outputs to `images/dst/sweep/`.
+Runs the binary over altitudes `[200, 300, 400 m]` × pitches `[-60° … -85°]`
+and saves all 18 outputs to `images/dst/sweep/`.
 
 ---
 
 ## Task 2 — NN Localisation System
 
-### Architecture overview
-
-Two stages:
-
-**Stage 1 — Coarse retrieval** finds which satellite tile(s) the drone is
-flying over.
-
-**Stage 2 — Fine localisation** finds the exact sub-metre position within the
-best tile.
+### Architecture
 
 ```
-Bird's-eye patch (800×800)
+Bird's-eye patch (800×800, auto-cropped to non-black bbox)
         │
         ▼
-  Encoder (MobileNetV3-Small)
-  Shared weights — Siamese
-  576 → 256 → 128 dim, L2-norm
+  Encoder — MobileNetV3-Small (ImageNet pretrained, fine-tunable)
+  Shared weights for drone and satellite branches (Siamese)
+  576-dim backbone → Linear(256) → BN → ReLU → Linear(128) → L2-norm
         │
         ▼
-  FAISS IndexFlatIP query
-  (pre-encoded satellite patches)
+  128-dim L2-normalised embedding
         │
         ▼
-  Top-K candidates (tile, patch offset)
+  FAISS IndexFlatIP — exact inner product (= cosine, embeddings are L2-normed)
+  Offline: slide window over satellite tiles, encode each patch, store
+  Online:  encode query → search top-K candidates
         │
         ▼
-  NCC template matching within best tile
-  cv2.matchTemplate TM_CCOEFF_NORMED
-  ±200 px search window, grayscale
+  NCC fine localisation — cv2.matchTemplate (TM_CCOEFF_NORMED, grayscale)
+  Query resized to fit satellite; ±100 px search around coarse hit
         │
         ▼
-  Drone (x, y) in tile pixels = metres
+  Drone (x, y) in satellite pixel coordinates
+        │
+        ▼
+  visualize — footprint overlay on satellite map saved as PNG
 ```
-
-### Real data in this repo
-
-| File | Size | Role |
-|------|------|------|
-| `images/src/processed/image_fpv_drone.png` | 490×216 px | Raw FPV input |
-| `images/src/processed/satellite_map.png` | 570×570 px | Reference satellite map |
-| `images/dst/dst/birds_eye_map_*.png` | 800×800 px | Task 1 output (bird's-eye warp) |
-
-The bird's-eye output is 800×800 but contains a large black border — at 60 m /
--25° pitch, only the top ~412 rows have real ground pixels. The query pipeline
-auto-crops this black border before encoding. For better ground coverage use
-steeper pitch angles (≥ -40° at ≥ 150 m).
-
-The satellite map (570×570) is smaller than the 800 px patch size originally
-assumed. The updated sliding window automatically adapts: `eff_patch =
-min(patch_size, H, W)`, so at least one patch is always extracted regardless of
-map size.
-
-> Keep only satellite images in `--tiles-dir` when building the index.
-> If FPV or bird's-eye images share the same folder they will be indexed too.
 
 ### Setup
 
 ```bash
-cd nn
-pip install -r requirements.txt
-# or via conda:
+# Conda (recommended — matches the pytorch-cuda env used during development)
 conda install -c conda-forge opencv
 conda install -c pytorch faiss-cpu
+
+# Or pip
+cd nn && pip install -r requirements.txt
 ```
 
 ### Training
 
 ```bash
-# Overfit sanity check (single synthetic pair — passes in ~4 steps on GPU)
+cd nn
+
+# Overfit sanity check — single synthetic pair, proves gradients flow
+# Expected: loss < 0.05 within ~4 steps on GPU
 python train.py --overfit
 
-# Full training on synthetic data
+# Full synthetic training (no real data needed)
 python train.py --epochs 20 --batch-size 32
 
 # Custom hyperparameters
@@ -211,63 +198,56 @@ python train.py --epochs 50 --batch-size 64 --lr 1e-4 --temperature 0.1
 
 # Resume from checkpoint
 python train.py --checkpoint checkpoints/epoch_015.pt
-
-# Force device
-python train.py --device cuda
 ```
 
-Checkpoints are saved every 5 epochs to `checkpoints/epoch_XXX.pt` and at the
-end as `checkpoints/final.pt`.
+Checkpoints saved every 5 epochs → `checkpoints/epoch_XXX.pt`, and at end →
+`checkpoints/final.pt`.
 
 **Loss — InfoNCE (symmetric NT-Xent):**
-
 ```
-L = -1/N Σ log( exp(q·k / τ) / Σ exp(q·k_neg / τ) )
+L = -1/N Σ log( exp(q·k / τ) / Σ_j exp(q·k_j / τ) )
 ```
-
-Positive pairs: `(bird's-eye patch at location X, satellite crop at location X)`.
-Negatives: all other crops in the batch. Temperature τ = 0.07 (default).
-
-**Augmentation:**
-
-| Branch | Transforms |
-|--------|-----------|
-| Drone (query) | RandomResizedCrop (0.85–1.0), RandomAffine shear ±5° (pitch proxy), ColorJitter, RandomHorizontalFlip |
-| Satellite (key) | RandomResizedCrop (0.9–1.0), RandomRotation ±180°, mild ColorJitter |
+Positive pair: (bird's-eye patch at X, satellite crop at X).
+Negatives: all other satellite crops in the batch. Temperature τ = 0.07.
 
 ### Inference
 
-#### 1. Build the FAISS index (offline, once per map update)
+All inference commands run from `nn/`.
+
+#### Step 1 — Build the FAISS index (offline, once per map)
 
 ```bash
-# With the real satellite_map.png (570×570):
 python inference.py build \
     --tiles-dir ../images/src/processed/ \
     --index-out index.faiss \
     --patch-size 256 --stride 100
-
-# Output:
-# [1/1] satellite_map.png (570×570px, eff_patch=256px): 16 patches
-# Index saved → index.faiss  (16 vectors, D=128)
 ```
 
-The `--patch-size` is automatically clamped to the image dimensions, so this
-works for satellite maps of any size. Use `--patch-size 800 --stride 200` for
-full 1 km² tiles.
+> Put **only satellite images** in `--tiles-dir`. Other images (FPV, bird's-eye)
+> in the same folder will be indexed too and pollute results.
 
-#### 2. Query (online, per frame)
+Output:
+```
+[1/1] satellite_map.png (570×570px, eff_patch=256px): 16 patches
+Index saved → index.faiss  (16 vectors, D=128)
+```
+
+The patch size is clamped to `min(patch_size, H, W)` automatically, so this
+works for satellite maps of any size.
+
+#### Step 2 — Query (per frame, full two-stage pipeline)
 
 ```bash
 python inference.py query \
-    --image ../images/dst/dst/birds_eye_map_20260407_113340_150_-40_0_0_110_80.png \
-    --index index.faiss \
+    --image  ../images/dst/dst/birds_eye_map_20260407_113340_150_-40_0_0_110_80.png \
+    --index  index.faiss \
     --tiles-dir ../images/src/processed/ \
     --top-k 5
 ```
 
-Omit `--tiles-dir` to skip NCC and get coarse results only.
+Omit `--tiles-dir` to skip NCC and return coarse results only.
 
-**Real output (ImageNet weights, no fine-tuning):**
+Output:
 ```
 Non-black crop: 800×800 → 800×412 px
 
@@ -281,14 +261,33 @@ Fine localisation (NCC, 15.6 ms):
   Tile       : satellite_map
   Match TL   : (0, 277) px in tile
   Drone pos  : (400, 483) px from tile origin
-  NCC score  : 0.3469
+  NCC score  : 0.3469  (1.0 = perfect match)
   Total time : 72.7 ms
 ```
 
-Cosine scores are low (< 0.1) because the encoder has not been fine-tuned on
-drone/satellite imagery. They improve significantly with contrastive training.
+> Cosine scores < 0.1 are expected with ImageNet-only weights. They improve
+> significantly after contrastive fine-tuning on real drone+satellite pairs.
 
-#### 3. Export to ONNX (RPi5 deployment)
+#### Step 3 — Visualize the visible ground footprint
+
+Highlights the exact ground region visible in the bird's-eye image directly on
+the satellite map. Does **not** require a FAISS index or trained weights — runs
+purely on geometry + NCC.
+
+```bash
+python inference.py visualize \
+    --image     ../images/dst/dst/birds_eye_map_20260407_113340_150_-40_0_0_110_80.png \
+    --satellite ../images/src/processed/satellite_map.png \
+    --out       result.png
+```
+
+Output `result.png`:
+- **Cyan fill** — ground region visible from the drone (trapezoid mask)
+- **Yellow contour** — border of the visible footprint
+- **Red dot + crosshair** — drone position projected onto the satellite
+- **Legend** — NCC score and drone coordinates
+
+#### Step 4 — Export to ONNX (RPi5 deployment)
 
 ```bash
 python inference.py export \
@@ -296,34 +295,34 @@ python inference.py export \
     --out encoder.onnx
 ```
 
-The resulting `encoder.onnx` runs on `onnxruntime` (pre-installable on RPi5
-via `pip install onnxruntime`). Dynamic INT8 quantisation is applied.
+Run on RPi5 with `onnxruntime`:
+```bash
+pip install onnxruntime faiss-cpu opencv-python
+```
 
-**Measured latency (CPU, PyTorch FP32, no fine-tuning):** ~73 ms total.
-**Target latency on RPi5 (ONNX INT8):**
+**Latency budget:**
 
-| Stage | Time |
-|-------|------|
-| Encoder (ONNX INT8) | ~30 ms |
-| FAISS search | < 1 ms |
-| NCC fine alignment | ~15 ms |
-| **Total** | **~50–65 ms** |
+| Stage | CPU (FP32) | RPi5 target (ONNX INT8) |
+|-------|-----------|------------------------|
+| Encode | ~57 ms | ~30 ms |
+| FAISS search | < 1 ms | < 1 ms |
+| NCC fine align | ~15 ms | ~15 ms |
+| **Total** | **~73 ms** | **~50 ms** |
 
 ---
 
 ## Dependencies
 
 ### C++
-- CMake ≥ 3.16
-- OpenCV (any recent version)
-- C++17
+- CMake ≥ 3.16, OpenCV, C++17 compiler
 
 ### Python
+
 | Package | Purpose |
 |---------|---------|
 | `torch` + `torchvision` | Model training and inference |
-| `faiss-cpu` | Approximate nearest-neighbour retrieval |
-| `opencv-python` | Image I/O, NCC template matching |
+| `faiss-cpu` | Nearest-neighbour retrieval |
+| `opencv-python` | Image I/O, NCC template matching, visualisation |
 | `onnx` + `onnxruntime` | Export and deploy on RPi5 |
 | `numpy`, `Pillow` | Array ops, image transforms |
 
@@ -331,13 +330,8 @@ via `pip install onnxruntime`). Dynamic INT8 quantisation is applied.
 
 ## Known Limitations
 
-- **Image path hardcoded** — `IMAGE_PATH` in `main.cpp` must be updated manually.
-- **No real training data** — `SyntheticPairDataset` generates random pairs.
-  Localisation quality will be limited until real drone + satellite pairs are
-  collected. See `nn/data/dataset.py` (`RealPairDataset`) for the expected data
-  layout.
-- **NCC fails under large yaw** — if the drone heading differs significantly
-  from north, the NCC search window may miss the correct position. A compass
-  reading would constrain the search.
-- **Single-scale encoder** — may struggle in texture-poor areas (open water,
-  bare fields).
+- **Hardcoded input path** — `IMAGE_PATH` in `cv/main.cpp` must be changed manually to point to a different FPV image.
+- **No real training data** — the encoder uses ImageNet weights only. Localisation accuracy will be low until fine-tuned on real drone + satellite pairs. See `nn/data/dataset.py` (`RealPairDataset`) for the expected data layout.
+- **NCC sensitive to yaw** — if the drone heading differs greatly from north, the trapezoid match may fail. A compass reading or multi-rotation NCC search would help.
+- **Single-scale encoder** — may struggle in texture-poor areas (open fields, water).
+- **Satellite map smaller than design** — the repo's `satellite_map.png` (570×570) is a single small reference image; a real deployment uses 500 × 1 km² tiles.
