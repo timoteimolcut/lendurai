@@ -228,6 +228,16 @@ int main(int argc, char** argv) {
     double      h_fov_deg = std::atof(argv[5]);
     double      v_fov_deg = std::atof(argv[6]);
 
+    // Guard: altitude must be positive (zero causes division by zero in ground projection)
+    if (altitude <= 0.0) {
+        std::cerr << "ERROR: altitude must be > 0 m, got " << altitude << std::endl;
+        return -1;
+    }
+    if (h_fov_deg <= 0.0 || h_fov_deg >= 180.0 || v_fov_deg <= 0.0 || v_fov_deg >= 180.0) {
+        std::cerr << "ERROR: FOV values must be in (0, 180) degrees." << std::endl;
+        return -1;
+    }
+
     double h_fov_rad = h_fov_deg * (M_PI / 180.0);
     double v_fov_rad = v_fov_deg * (M_PI / 180.0);
     double roll_rad  = roll_deg  * (M_PI / 180.0);

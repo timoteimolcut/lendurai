@@ -1,0 +1,73 @@
+# ── C++ build artifacts ──────────────────────────────────────────
+cv/build/
+cv/birdseye
+*.o
+*.a
+*.so
+*.out
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+CTestTestfile.cmake
+
+# ── Python ───────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ── Virtual environments ─────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+*.env
+
+# ── ML artifacts ─────────────────────────────────────────────────
+nn/checkpoints/
+nn/index.faiss
+nn/index.npz
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tflite
+wandb/
+lightning_logs/
+runs/
+
+# ── Data / images (large files) ──────────────────────────────────
+images/
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+# Un-ignore small reference images if needed:
+# !images/src/reference.png
+
+# ── Jupyter ──────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── IDEs ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Logs & tmp ───────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
