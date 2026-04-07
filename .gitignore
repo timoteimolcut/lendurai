@@ -1,6 +1,6 @@
 # ── C++ build artifacts ──────────────────────────────────────────
-cv/build/
-cv/birdseye
+./cv/build/
+./cv/birdseye
 *.o
 *.a
 *.so
@@ -45,7 +45,7 @@ lightning_logs/
 runs/
 
 # ── Data / images (large files) ──────────────────────────────────
-images/
+./images/
 *.png
 *.jpg
 *.jpeg

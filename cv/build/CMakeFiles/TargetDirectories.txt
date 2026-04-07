@@ -1,3 +1,0 @@
-/home/timct/github/lendurai/cv/build/CMakeFiles/birdseye.dir
-/home/timct/github/lendurai/cv/build/CMakeFiles/edit_cache.dir
-/home/timct/github/lendurai/cv/build/CMakeFiles/rebuild_cache.dir
